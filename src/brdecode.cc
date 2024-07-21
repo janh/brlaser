@@ -22,6 +22,7 @@
 #include <exception>
 #include <vector>
 #include <string>
+#include <functional>
 
 namespace {
 
@@ -32,6 +33,25 @@ std::vector<std::vector<uint8_t>> page;
 std::vector<uint8_t> line;
 size_t line_offset;
 
+
+class unsupported_compression: public std::exception {
+ private:
+  char msg[128];
+ public:
+  unsupported_compression(unsigned int type) {
+    sprintf(msg, "Unsupported raster compression type %d", type);
+  }
+  virtual const char *what() const noexcept {
+    return msg;
+  }
+};
+
+class read_past_block_end: public std::exception {
+ public:
+  virtual const char *what() const noexcept {
+    return "Attempt to read data past end of block";
+  }
+};
 
 class unexpected_eof: public std::exception {
  public:
@@ -55,25 +75,25 @@ uint8_t get() {
   return ch;
 }
 
-unsigned read_overflow() {
+unsigned read_overflow(std::function<uint8_t()> next_character) {
   uint8_t ch;
   unsigned sum = 0;
   do {
-    ch = get();
+    ch = next_character();
     sum += ch;
   } while (ch == 255);
   return sum;
 }
 
-void read_repeat(uint8_t cmd) {
+void read_repeat(uint8_t cmd, std::function<uint8_t()> next_character) {
   uint16_t offset = (cmd >> 5) & 3;
   if (offset == 3)
-    offset += read_overflow();
+    offset += read_overflow(next_character);
   uint16_t count = cmd & 31;
   if (count == 31)
-    count += read_overflow();
+    count += read_overflow(next_character);
   count += 2;
-  uint8_t data = get();
+  uint8_t data = next_character();
 
   size_t end = line_offset + offset + count;
   if (end > line.size()) {
@@ -86,13 +106,13 @@ void read_repeat(uint8_t cmd) {
   line_offset += count;
 }
 
-void read_substitute(uint8_t cmd) {
+void read_substitute(uint8_t cmd, std::function<uint8_t()> next_character) {
   uint16_t offset = (cmd >> 3) & 15;
   if (offset == 15)
-    offset += read_overflow();
+    offset += read_overflow(next_character);
   uint16_t count = cmd & 7;
   if (count == 7)
-    count += read_overflow();
+    count += read_overflow(next_character);
   count += 1;
 
   size_t end = line_offset + offset + count;
@@ -102,43 +122,45 @@ void read_substitute(uint8_t cmd) {
     line.resize(end);
   }
   line_offset += offset;
-  std::generate_n(line.begin() + line_offset, count, get);
+  std::generate_n(line.begin() + line_offset, count, next_character);
   line_offset += count;
 }
 
-void read_edit() {
-  int8_t cmd = get();
+void read_edit(std::function<uint8_t()> next_character) {
+  int8_t cmd = next_character();
   if (cmd < 0) {
-    read_repeat(cmd);
+    read_repeat(cmd, next_character);
   } else {
-    read_substitute(cmd);
+    read_substitute(cmd, next_character);
   }
 }
 
-void read_line() {
-  uint8_t num_edits = get();
+void read_line(std::function<uint8_t()> next_character) {
+  uint8_t num_edits = next_character();
   if (num_edits == 255) {
     line.clear();
   } else {
     line_offset = 0;
     for (int i = 0; i < num_edits; ++i) {
-      read_edit();
+      read_edit(next_character);
     }
   }
   page.push_back(line);
 }
 
-void read_block() {
-  unsigned count = get();
-  count = count * 256 + get();
+void read_block(std::function<uint8_t()> next_character) {
+  unsigned count = next_character();
+  count = count * 256 + next_character();
   for (unsigned i = 0; i < count; ++i) {
-    read_line();
+    read_line(next_character);
   }
 }
 
 bool read_page() {
-  bool in_esc = false;
-  int ch;
+  bool in_raster = false;
+  unsigned number, digit;
+  int format = 0;
+  int ch, ch1, ch2;
 
   page.clear();
   line.clear();
@@ -146,11 +168,48 @@ bool read_page() {
     if (ch == '\f') {
       break;
     } else if (ch == 033) {
-      in_esc = true;
-    } else if (in_esc && ch == 'w') {
-      read_block();
-    } else if (in_esc && (ch >= 'A' && ch <= 'Z')) {
-      in_esc = false;
+      ch1 = get();
+      ch2 = get();
+      if (ch1 == '*' && ch2 == 'b') {
+        // start of PCL raster escape sequence
+        in_raster = true;
+        number = 0;
+      }
+    } else if (in_raster) {
+      if (ch >= '0' && ch <= '9') {
+        // parse value field
+        digit = ch - '0';
+        number = number * 10 + digit;
+      } else if (ch == 'm' || ch == 'M') {
+        // format parameter
+        format = number;
+      } else if (ch == 'w' || ch == 'W') {
+        // graphics data
+        auto get_next_block_character = [&]() {
+          if (number <= 0)
+            throw read_past_block_end();
+          number--;
+          return get();
+        };
+        if (format == 1030) {
+          read_block(get_next_block_character);
+        } else {
+          throw unsupported_compression(format);
+        }
+        if (number > 0) {
+          fprintf(stderr, "WARNING: %d unread bytes in block\n", number);
+          for (; number > 0; number--) {
+            get();
+          }
+        }
+      }
+      if (ch >= '`' && ch <= '~') {
+        // lowercase -> parameter character
+        number = 0;
+      } else if (ch >= '@' && ch <= '^') {
+        // uppercase -> terminating character
+        in_raster = false;
+      }
     }
   }
   return !page.empty();
