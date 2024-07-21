@@ -46,6 +46,18 @@ class unsupported_compression: public std::exception {
   }
 };
 
+class unexpected_line_header: public std::exception {
+ private:
+  char msg[128];
+ public:
+  unexpected_line_header(uint16_t header) {
+    sprintf(msg, "Unexpected line header %04x (this might be a bug in brdecode)", header);
+  }
+  virtual const char *what() const noexcept {
+    return msg;
+  }
+};
+
 class read_past_block_end: public std::exception {
  public:
   virtual const char *what() const noexcept {
@@ -85,7 +97,7 @@ unsigned read_overflow(std::function<uint8_t()> next_character) {
   return sum;
 }
 
-void read_repeat(uint8_t cmd, std::function<uint8_t()> next_character) {
+void read_repeat(uint8_t cmd, std::function<uint8_t()> next_character, size_t bytes) {
   uint16_t offset = (cmd >> 5) & 3;
   if (offset == 3)
     offset += read_overflow(next_character);
@@ -93,7 +105,9 @@ void read_repeat(uint8_t cmd, std::function<uint8_t()> next_character) {
   if (count == 31)
     count += read_overflow(next_character);
   count += 2;
-  uint8_t data = next_character();
+
+  offset *= bytes;
+  count *= bytes;
 
   size_t end = line_offset + offset + count;
   if (end > line.size()) {
@@ -102,11 +116,22 @@ void read_repeat(uint8_t cmd, std::function<uint8_t()> next_character) {
     line.resize(end);
   }
   line_offset += offset;
-  std::fill_n(line.begin() + line_offset, count, data);
+  if (bytes == 1) {
+    uint8_t data = next_character();
+    std::fill_n(line.begin() + line_offset, count, data);
+  } else {
+    std::vector<uint8_t> data(bytes);
+    for (size_t i = 0; i < bytes; i++) {
+      data[i] = next_character();
+    }
+    for (int i = 0; i < count; i++) {
+      line[line_offset + i] = data[i % bytes];
+    }
+  }
   line_offset += count;
 }
 
-void read_substitute(uint8_t cmd, std::function<uint8_t()> next_character) {
+void read_substitute(uint8_t cmd, std::function<uint8_t()> next_character, size_t bytes) {
   uint16_t offset = (cmd >> 3) & 15;
   if (offset == 15)
     offset += read_overflow(next_character);
@@ -114,6 +139,9 @@ void read_substitute(uint8_t cmd, std::function<uint8_t()> next_character) {
   if (count == 7)
     count += read_overflow(next_character);
   count += 1;
+
+  offset *= bytes;
+  count *= bytes;
 
   size_t end = line_offset + offset + count;
   if (end > line.size()) {
@@ -126,12 +154,12 @@ void read_substitute(uint8_t cmd, std::function<uint8_t()> next_character) {
   line_offset += count;
 }
 
-void read_edit(std::function<uint8_t()> next_character) {
+void read_edit(std::function<uint8_t()> next_character, size_t bytes) {
   int8_t cmd = next_character();
   if (cmd < 0) {
-    read_repeat(cmd, next_character);
+    read_repeat(cmd, next_character, bytes);
   } else {
-    read_substitute(cmd, next_character);
+    read_substitute(cmd, next_character, bytes);
   }
 }
 
@@ -142,7 +170,7 @@ void read_line(std::function<uint8_t()> next_character) {
   } else {
     line_offset = 0;
     for (int i = 0; i < num_edits; ++i) {
-      read_edit(next_character);
+      read_edit(next_character, 1);
     }
   }
   page.push_back(line);
@@ -153,6 +181,32 @@ void read_block(std::function<uint8_t()> next_character) {
   count = count * 256 + next_character();
   for (unsigned i = 0; i < count; ++i) {
     read_line(next_character);
+  }
+}
+
+void read_line2(std::function<uint8_t()> next_character) {
+  uint16_t header = next_character();
+  header = header * 256 + next_character();
+  if (header == 0xffff) {
+    line.clear();
+  } else {
+    line_offset = 0;
+    if ((header & 0xff00) != 0x3000 && header != 0) {
+      throw unexpected_line_header(header);
+    }
+    uint8_t num_edits = header & 0xff;
+    for (int i = 0; i < num_edits; ++i) {
+      read_edit(next_character, 2);
+    }
+  }
+  page.push_back(line);
+}
+
+void read_block2(std::function<uint8_t()> next_character) {
+  unsigned count = next_character();
+  count = count * 256 + next_character();
+  for (unsigned i = 0; i < count; ++i) {
+    read_line2(next_character);
   }
 }
 
@@ -193,6 +247,8 @@ bool read_page() {
         };
         if (format == 1030) {
           read_block(get_next_block_character);
+        } else if (format == 1032) {
+          read_block2(get_next_block_character);
         } else {
           throw unsupported_compression(format);
         }
